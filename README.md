@@ -1,8 +1,9 @@
 # avbgraft
 
-> If avbgraft is useful to you, a ⭐ on the repo is appreciated, and please star
+> ⭐ If avbgraft is useful to you, a star on the repo is appreciated.
+> Please also star the projects it stands on:
 > [avbroot](https://github.com/chenxiaolong/avbroot) and
-> [regraph](https://github.com/tmzt/regraph) too.
+> [regraph](https://github.com/tmzt/regraph).
 
 Repack a stock Pixel factory image into a **debuggable** one. It flips
 `ro.debuggable=0` to `1` in the system partition so a flashed device boots with
@@ -237,7 +238,10 @@ license below.
 
 ---
 
-**If avbgraft saved you time, please star this repo.** And please also star the
-projects it stands on, since they do the work that matters:
-**[avbroot](https://github.com/chenxiaolong/avbroot)** and
-**[regraph](https://github.com/tmzt/regraph)**.
+**⭐ If avbgraft saved you time, please star this repo.**
+
+And please also star the projects it stands on, since they do the work that
+matters:
+
+- ⭐ [avbroot](https://github.com/chenxiaolong/avbroot)
+- ⭐ [regraph](https://github.com/tmzt/regraph)
