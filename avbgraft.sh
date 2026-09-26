@@ -17,6 +17,11 @@
 #
 # Usage:
 #   ./avbgraft.sh --factory <bluejay-*-factory-*.zip> --out ./out [--key key.pem]
+#                 [--insecure-adb]
+#
+# --insecure-adb also sets ro.adb.secure=0, so adb connects with no RSA prompt.
+# It disables adb key authorization entirely (any USB host gets a shell), so use
+# it only on disposable lab/test devices.
 #
 # Output (in --out): system.img, vbmeta_system.img, vbmeta.img, and the public
 # key as avb_pkmd.bin. Flash them with flash.sh, or by hand:
@@ -34,6 +39,7 @@ FACTORY=""
 OUT="./out"
 KEY=""
 KEEP_WORK=0
+INSECURE_ADB=0
 
 usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -46,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --key)       KEY="$2"; shift 2 ;;
     --key=*)     KEY="${1#*=}"; shift ;;
     --keep-work) KEEP_WORK=1; shift ;;
+    --insecure-adb) INSECURE_ADB=1; shift ;;
     -h|--help)   usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -86,7 +93,7 @@ else
 fi
 
 # Everything below runs inside the container against the bind-mounted work dir.
-docker run --rm --platform linux/arm64 -v "$WORK:/work" "$IMAGE" bash -euo pipefail -c '
+docker run --rm --platform linux/arm64 -e INSECURE_ADB="$INSECURE_ADB" -v "$WORK:/work" "$IMAGE" bash -euo pipefail -c '
   cd /work
   echo "[c] extracting our public key (avb_pkmd)"
   avbroot key extract-avb -k key.pem -o key_pub.bin
@@ -96,15 +103,22 @@ docker run --rm --platform linux/arm64 -v "$WORK:/work" "$IMAGE" bash -euo pipef
   # avb unpack writes avb.toml + raw.img in the cwd
   STOCK_SYS_DIGEST="$(grep -m1 "root_digest" avb.toml | sed "s/.*= *//; s/[\" ]//g")"
 
-  echo "[c] patching ro.debuggable=0 -> 1 in /system/build.prop (system-as-root ext4)"
+  echo "[c] patching /system/build.prop (system-as-root ext4)"
   debugfs -R "dump /system/build.prop /tmp/bp" raw.img 2>/dev/null
+  # ro.debuggable=1 -> adbd starts at boot with no Developer-options toggle.
   sed "s/^ro.debuggable=0\$/ro.debuggable=1/" /tmp/bp > /tmp/bp.new
+  # Optional: ro.adb.secure=0 -> adbd skips RSA host authorization (no prompt).
+  # This disables adb key auth entirely; only for disposable lab/test devices.
+  if [ "${INSECURE_ADB:-0}" = "1" ]; then
+    sed -i "s/^ro.adb.secure=1\$/ro.adb.secure=0/" /tmp/bp.new
+    echo "[c] insecure-adb: ro.adb.secure=1 -> 0 (adb connects with no RSA prompt)"
+  fi
   if ! cmp -s /tmp/bp /tmp/bp.new; then
     printf "rm /system/build.prop\nwrite /tmp/bp.new /system/build.prop\n" | debugfs -w raw.img 2>/dev/null
   else
-    echo "[c] warning: ro.debuggable=0 not found verbatim; build.prop unchanged" >&2
+    echo "[c] warning: no property lines matched; build.prop unchanged" >&2
   fi
-  debugfs -R "cat /system/build.prop" raw.img 2>/dev/null | grep -i "^ro.debuggable" || true
+  debugfs -R "cat /system/build.prop" raw.img 2>/dev/null | grep -iE "^ro.debuggable|^ro.adb.secure" || true
 
   echo "[c] repacking system.img with recomputed hashtree + FEC, signed with our key"
   avbroot avb pack --output out_system.img --input-info avb.toml --input-raw raw.img --key key.pem

@@ -1,5 +1,9 @@
 # avbgraft
 
+> If avbgraft is useful to you, a ⭐ on the repo is appreciated, and please star
+> [avbroot](https://github.com/chenxiaolong/avbroot) and
+> [regraph](https://github.com/tmzt/regraph) too.
+
 Repack a stock Pixel factory image into a **debuggable** one. It flips
 `ro.debuggable=0` to `1` in the system partition so a flashed device boots with
 `adbd` enabled and no Developer-options toggle, then rebuilds the whole
@@ -88,6 +92,31 @@ Apple Silicon. Pin a different avbroot with `--build-arg AVBROOT_VERSION=x.y.z`.
   `avb_pkmd.bin` (your public key, for `avb_custom_key`).
 
 The script verifies the full chain against your key before finishing.
+
+### `--insecure-adb` (no RSA prompt)
+
+By default the patched image sets `ro.debuggable=1`, which starts `adbd` at
+boot. The first host connection still shows the "Allow USB debugging from this
+computer?" prompt, because stock keeps `ro.adb.secure=1`.
+
+Pass `--insecure-adb` to also flip `ro.adb.secure=0`, which disables adb key
+authorization entirely: any host connects with no prompt and `adb shell` works
+immediately.
+
+```bash
+./avbgraft.sh --factory <zip> --out ./out --insecure-adb
+```
+
+This is a real security reduction (any USB host gets a shell with no approval),
+so it is off by default and intended only for disposable lab/test devices.
+
+Note: neither flag skips the first-boot Setup Wizard. With `--insecure-adb` you
+can drive it over adb once the device is up, for example:
+
+```bash
+adb shell settings put global device_provisioned 1
+adb shell settings put secure  user_setup_complete 1
+```
 
 ## Flash
 
@@ -208,6 +237,7 @@ license below.
 
 ---
 
-**If avbgraft helped you, please star the projects it stands on.** They do the
-work that matters: **[avbroot](https://github.com/chenxiaolong/avbroot)** and
+**If avbgraft saved you time, please star this repo.** And please also star the
+projects it stands on, since they do the work that matters:
+**[avbroot](https://github.com/chenxiaolong/avbroot)** and
 **[regraph](https://github.com/tmzt/regraph)**.
