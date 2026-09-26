@@ -89,8 +89,10 @@ Apple Silicon. Pin a different avbroot with `--build-arg AVBROOT_VERSION=x.y.z`.
 
 - Reuses an existing signing key with `--key mykey.pem`; otherwise it generates
   a fresh RSA4096 key and writes it to `out/signing_key.pem`.
-- Output in `out/`: `system.img`, `vbmeta_system.img`, `vbmeta.img`, and
-  `avb_pkmd.bin` (your public key, for `avb_custom_key`).
+- Output in `out/`: `system.img`, `vbmeta_system.img`, `vbmeta.img`,
+  `avb_pkmd.bin` (your public key, for `avb_custom_key`), and `update.zip` (a
+  copy of the stock image zip with the three re-signed images swapped in, for
+  `fastboot update`).
 
 The script verifies the full chain against your key before finishing.
 
@@ -125,15 +127,24 @@ adb shell settings put secure  user_setup_complete 1
 ./flash.sh --out ./out --serial <SERIAL>
 ```
 
-or by hand, in fastboot:
+`flash.sh` registers the custom key and then runs `fastboot update`, which
+follows the vendor `fastboot-info.txt` sequence: it flashes `vbmeta` and
+`vbmeta_system`, reboots into fastbootd, resizes `super`, then flashes the
+logical `system` partition. This is the sequence Google's own factory
+`flash-all` uses.
+
+By hand, in fastboot:
 
 ```bash
 fastboot flash avb_custom_key out/avb_pkmd.bin
-fastboot flash system         out/system.img
-fastboot flash vbmeta_system  out/vbmeta_system.img
-fastboot flash vbmeta         out/vbmeta.img
-fastboot reboot
+fastboot -w update out/update.zip
 ```
+
+`system` is a logical partition inside `super`, so it cannot be flashed from the
+regular bootloader (`fastboot flash system` fails with
+`resize-logical-partition ... Invalid command`). It must be flashed from
+fastbootd, which `fastboot update` enters automatically. Use `--no-wipe` on the
+script (or drop `-w`) to keep userdata.
 
 ## Caveats
 

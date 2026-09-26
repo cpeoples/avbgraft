@@ -191,6 +191,29 @@ cp "$WORK/out_vbmeta.img"        "$OUT/vbmeta.img"
 cp "$WORK/key_pub.bin"           "$OUT/avb_pkmd.bin"
 cp "$WORK/key.pem"               "$OUT/signing_key.pem"
 
+# Build a modified update zip: a copy of the stock inner image-*.zip with our
+# three re-signed images swapped in. `fastboot update` reads this zip and runs
+# the vendor fastboot-info.txt sequence, which flashes vbmeta first, reboots
+# into fastbootd on its own, resizes super, then flashes the logical system
+# partition. This is the reliable way to flash a re-signed system: it avoids
+# flashing logical partitions from the regular bootloader (which fails) and
+# avoids manually wrangling fastbootd.
+if command -v zip >/dev/null 2>&1; then
+  echo "[avbgraft] building update zip (stock image zip + our re-signed images) ..."
+  UPDATE_DIR="$WORK/update"
+  mkdir -p "$UPDATE_DIR"
+  cp "$INNER" "$UPDATE_DIR/image.zip"
+  # Overwrite only the three images we re-signed; everything else stays stock.
+  cp "$WORK/out_system.img"        "$UPDATE_DIR/system.img"
+  cp "$WORK/out_vbmeta.img"        "$UPDATE_DIR/vbmeta.img"
+  cp "$WORK/out_vbmeta_system.img" "$UPDATE_DIR/vbmeta_system.img"
+  ( cd "$UPDATE_DIR" && zip -q image.zip system.img vbmeta.img vbmeta_system.img )
+  cp "$UPDATE_DIR/image.zip" "$OUT/update.zip"
+else
+  echo "[avbgraft] warning: 'zip' not found on host; skipping update.zip build" >&2
+  echo "[avbgraft] install zip, or flash the individual images (see README)" >&2
+fi
+
 echo
 echo "[avbgraft] done. Artifacts in $OUT:"
 ls -la "$OUT" | awk 'NR>1 {print "  " $5 "  " $9}'
