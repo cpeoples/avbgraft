@@ -1,0 +1,23 @@
+# Keys: never commit signing material
+*.pem
+*.key
+keys/
+*_key*.bin
+avb_pkmd.bin
+
+# Large partition/factory images and downloads
+*.img
+*.zip
+downloads/
+work/
+out/
+*.toml.local
+
+# Extracted / staged working dirs
+raw.img
+avb.toml
+verify/
+
+# OS / editor
+.DS_Store
+*.log
