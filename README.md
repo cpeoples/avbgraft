@@ -96,30 +96,55 @@ Apple Silicon. Pin a different avbroot with `--build-arg AVBROOT_VERSION=x.y.z`.
 
 The script verifies the full chain against your key before finishing.
 
-### `--insecure-adb` (no RSA prompt)
+### `--insecure-adb` (no RSA prompt) and `--bake-adb-key` (pre-authorized host)
 
 By default the patched image sets `ro.debuggable=1`, which starts `adbd` at
 boot. The first host connection still shows the "Allow USB debugging from this
-computer?" prompt, because stock keeps `ro.adb.secure=1`.
+computer?" prompt.
 
-Pass `--insecure-adb` to also flip `ro.adb.secure=0`, which disables adb key
-authorization entirely: any host connects with no prompt and `adb shell` works
-immediately.
+There are two ways to remove that prompt:
+
+- **`--bake-adb-key[=<adbkey.pub>]`** (recommended) writes an adb public key into
+  product at `/product/etc/security/adb_keys` (the target of the `/adb_keys`
+  symlink), labeled `u:object_r:adb_keys_file:s0` so SELinux allows it. The
+  device then pre-authorizes that host with no prompt, even with
+  `ro.adb.secure=1`. With no value it uses `~/.android/adbkey.pub`, generating
+  one with `adb keygen` if it does not exist. This also patches and re-signs
+  `product.img` and updates the product digest in `vbmeta_system`, so `out/` and
+  `update.zip` will include `product.img`.
+
+- **`--insecure-adb`** flips `ro.adb.secure=0` in `/system/build.prop`. On this
+  Pixel build the effective `ro.adb.secure` is sourced from the boot ramdisk,
+  not `/system/build.prop`, so this flag alone does not remove the prompt.
+  Prefer `--bake-adb-key`.
 
 ```bash
-./avbgraft.sh --factory <zip> --out ./out --insecure-adb
+# promptless adb by pre-authorizing your host key (validated end to end):
+./avbgraft.sh --factory <zip> --out ./out --bake-adb-key
 ```
 
-This is a real security reduction (any USB host gets a shell with no approval),
-so it is off by default and intended only for disposable lab/test devices.
+After flashing with `--bake-adb-key`, `adb shell` works immediately with no tap,
+even after a userdata wipe, because the authorization lives in `product`, not in
+`/data`.
 
-Note: neither flag skips the first-boot Setup Wizard. With `--insecure-adb` you
-can drive it over adb once the device is up, for example:
+### Skipping the Setup Wizard
+
+avbgraft does not bake a Setup Wizard skip into the image, and it cannot: the
+wizard state lives in the `settings` provider on the `/data` partition, which is
+wiped on every flash, and the legacy `ro.setupwizard.*` build properties are
+ignored on current Pixels. Skip it at runtime over adb instead (this is why
+promptless adb via `--bake-adb-key` matters):
 
 ```bash
 adb shell settings put global device_provisioned 1
 adb shell settings put secure  user_setup_complete 1
+adb shell settings put global setup_wizard_has_run 1
+adb shell am force-stop com.google.android.setupwizard
+adb shell am force-stop com.google.android.pixel.setupwizard
 ```
+
+Modern Pixels run two setup wizard packages (`com.google.android.setupwizard`
+and `com.google.android.pixel.setupwizard`); stop both.
 
 ## Flash
 

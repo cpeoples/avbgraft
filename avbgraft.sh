@@ -17,11 +17,18 @@
 #
 # Usage:
 #   ./avbgraft.sh --factory <bluejay-*-factory-*.zip> --out ./out [--key key.pem]
-#                 [--insecure-adb]
+#                 [--insecure-adb] [--bake-adb-key[=<adbkey.pub>]]
 #
-# --insecure-adb also sets ro.adb.secure=0, so adb connects with no RSA prompt.
-# It disables adb key authorization entirely (any USB host gets a shell), so use
-# it only on disposable lab/test devices.
+# --insecure-adb also sets ro.adb.secure=0 in /system/build.prop. On some builds
+# ro.adb.secure is sourced from the boot ramdisk and this has no effect, so
+# prefer --bake-adb-key for promptless adb.
+#
+# --bake-adb-key writes an adb public key into product at
+# /product/etc/security/adb_keys (the target of the /adb_keys symlink), labeled
+# u:object_r:adb_keys_file:s0, so the device pre-authorizes that host with no
+# prompt even while ro.adb.secure=1. With no value it uses ~/.android/adbkey.pub,
+# generating one with `adb keygen` if it does not exist. This also patches and
+# re-signs product.img and updates the product digest in vbmeta_system.
 #
 # Output (in --out): system.img, vbmeta_system.img, vbmeta.img, and the public
 # key as avb_pkmd.bin. Flash them with flash.sh, or by hand:
@@ -40,8 +47,10 @@ OUT="./out"
 KEY=""
 KEEP_WORK=0
 INSECURE_ADB=0
+BAKE_ADB_KEY=0
+ADB_KEY_PATH=""
 
-usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     --key=*)     KEY="${1#*=}"; shift ;;
     --keep-work) KEEP_WORK=1; shift ;;
     --insecure-adb) INSECURE_ADB=1; shift ;;
+    --bake-adb-key)    BAKE_ADB_KEY=1; shift ;;
+    --bake-adb-key=*)  BAKE_ADB_KEY=1; ADB_KEY_PATH="${1#*=}"; shift ;;
     -h|--help)   usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -92,8 +103,35 @@ else
   echo "[avbgraft] generated a new RSA4096 signing key"
 fi
 
+# Resolve the adb public key to bake in, if requested.
+#   1. --bake-adb-key=<path>       -> use that file
+#   2. --bake-adb-key (no value)   -> ~/.android/adbkey.pub
+#   3. if that is missing          -> `adb keygen ~/.android/adbkey` then use it
+if [[ "$BAKE_ADB_KEY" -eq 1 ]]; then
+  if [[ -z "$ADB_KEY_PATH" ]]; then
+    ADB_KEY_PATH="$HOME/.android/adbkey.pub"
+    if [[ ! -f "$ADB_KEY_PATH" ]]; then
+      if command -v adb >/dev/null 2>&1; then
+        echo "[avbgraft] no adb key at $ADB_KEY_PATH; generating one with 'adb keygen'"
+        mkdir -p "$HOME/.android"
+        adb keygen "$HOME/.android/adbkey" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+  [[ -f "$ADB_KEY_PATH" ]] || {
+    echo "error: --bake-adb-key needs an adb public key, but none was found at" >&2
+    echo "       $ADB_KEY_PATH and 'adb keygen' did not produce one." >&2
+    echo "       Install platform-tools, or pass --bake-adb-key=<adbkey.pub>." >&2
+    exit 1
+  }
+  cp "$ADB_KEY_PATH" "$WORK/adbkey.pub"
+  echo "[avbgraft] baking adb key: $ADB_KEY_PATH"
+fi
+
 # Everything below runs inside the container against the bind-mounted work dir.
-docker run --rm --platform linux/arm64 -e INSECURE_ADB="$INSECURE_ADB" -v "$WORK:/work" "$IMAGE" bash -euo pipefail -c '
+docker run --rm --platform linux/arm64 \
+  -e INSECURE_ADB="$INSECURE_ADB" -e BAKE_ADB_KEY="$BAKE_ADB_KEY" \
+  -v "$WORK:/work" "$IMAGE" bash -euo pipefail -c '
   cd /work
   echo "[c] extracting our public key (avb_pkmd)"
   avbroot key extract-avb -k key.pem -o key_pub.bin
@@ -125,10 +163,37 @@ docker run --rm --platform linux/arm64 -e INSECURE_ADB="$INSECURE_ADB" -v "$WORK
   NEW_SYS_DIGEST="$(avbroot avb info --input out_system.img 2>/dev/null | grep -m1 root_digest | sed "s/.*: *//; s/[\", ]//g")"
   echo "[c] system root_digest: $STOCK_SYS_DIGEST -> $NEW_SYS_DIGEST"
 
-  echo "[c] rebuilding vbmeta_system (all descriptors) with our new system digest"
+  # Optionally bake the host adb key into product at /etc/security/adb_keys
+  # (product-relative; runtime /product/etc/security/adb_keys). The /adb_keys
+  # symlink points here, so adbd pre-authorizes that host with no prompt. The
+  # file must be labeled u:object_r:adb_keys_file:s0 or SELinux denies it.
+  BAKE_PRODUCT=0
+  STOCK_PROD_DIGEST=""
+  NEW_PROD_DIGEST=""
+  if [ "${BAKE_ADB_KEY:-0}" = "1" ]; then
+    echo "[c] baking adb key into product /etc/security/adb_keys"
+    avbroot avb unpack --input img/product.img
+    mv avb.toml product.toml
+    mv raw.img product_raw.img
+    STOCK_PROD_DIGEST="$(grep -m1 "root_digest" product.toml | sed "s/.*= *//; s/[\" ]//g")"
+    # /etc/security exists on stock product; create the key file inside it.
+    printf "cd /etc/security\nwrite /work/adbkey.pub adb_keys\n" | debugfs -w product_raw.img 2>/dev/null
+    printf "ea_set /etc/security/adb_keys security.selinux u:object_r:adb_keys_file:s0\\000\n" | debugfs -w product_raw.img 2>/dev/null
+    echo "[c] product adb_keys context: $(debugfs -R "ea_list /etc/security/adb_keys" product_raw.img 2>/dev/null | grep selinux | tr -d " ")"
+    avbroot avb pack --output out_product.img --input-info product.toml --input-raw product_raw.img --key key.pem
+    NEW_PROD_DIGEST="$(avbroot avb info --input out_product.img 2>/dev/null | grep -m1 root_digest | sed "s/.*: *//; s/[\", ]//g")"
+    echo "[c] product root_digest: $STOCK_PROD_DIGEST -> $NEW_PROD_DIGEST"
+    BAKE_PRODUCT=1
+  fi
+
+  echo "[c] rebuilding vbmeta_system (all descriptors) with our new digests"
   avbroot avb unpack --input img/vbmeta_system.img
   mv avb.toml vbmeta_system.toml
   sed "s/${STOCK_SYS_DIGEST}/${NEW_SYS_DIGEST}/" vbmeta_system.toml > vbmeta_system_custom.toml
+  if [ "$BAKE_PRODUCT" = "1" ]; then
+    sed -i "s/${STOCK_PROD_DIGEST}/${NEW_PROD_DIGEST}/" vbmeta_system_custom.toml
+    echo "[c] swapped product digest into vbmeta_system as well"
+  fi
   avbroot avb pack --output out_vbmeta_system.img --input-info vbmeta_system_custom.toml --key key.pem
 
   echo "[c] rebuilding top-level vbmeta: graft our key into the vbmeta_system chain"
@@ -175,7 +240,7 @@ PY
   cp ../out_vbmeta.img        vbmeta.img
   cp ../out_vbmeta_system.img vbmeta_system.img
   cp ../out_system.img        system.img
-  cp ../img/product.img       product.img
+  if [ -f ../out_product.img ]; then cp ../out_product.img product.img; else cp ../img/product.img product.img; fi
   cp ../img/system_ext.img    system_ext.img
   cp ../img/pvmfw.img         pvmfw.img
   cp ../img/boot.img          boot.img
@@ -190,24 +255,30 @@ cp "$WORK/out_vbmeta_system.img" "$OUT/vbmeta_system.img"
 cp "$WORK/out_vbmeta.img"        "$OUT/vbmeta.img"
 cp "$WORK/key_pub.bin"           "$OUT/avb_pkmd.bin"
 cp "$WORK/key.pem"               "$OUT/signing_key.pem"
+[[ -f "$WORK/out_product.img" ]] && cp "$WORK/out_product.img" "$OUT/product.img"
 
 # Build a modified update zip: a copy of the stock inner image-*.zip with our
-# three re-signed images swapped in. `fastboot update` reads this zip and runs
-# the vendor fastboot-info.txt sequence, which flashes vbmeta first, reboots
-# into fastbootd on its own, resizes super, then flashes the logical system
-# partition. This is the reliable way to flash a re-signed system: it avoids
-# flashing logical partitions from the regular bootloader (which fails) and
-# avoids manually wrangling fastbootd.
+# re-signed images swapped in. `fastboot update` reads this zip and runs the
+# vendor fastboot-info.txt sequence, which flashes vbmeta first, reboots into
+# fastbootd on its own, resizes super, then flashes the logical system (and
+# product) partitions. This is the reliable way to flash a re-signed system: it
+# avoids flashing logical partitions from the regular bootloader (which fails)
+# and avoids manually wrangling fastbootd.
 if command -v zip >/dev/null 2>&1; then
   echo "[avbgraft] building update zip (stock image zip + our re-signed images) ..."
   UPDATE_DIR="$WORK/update"
   mkdir -p "$UPDATE_DIR"
   cp "$INNER" "$UPDATE_DIR/image.zip"
-  # Overwrite only the three images we re-signed; everything else stays stock.
+  # Overwrite only the images we re-signed; everything else stays stock.
   cp "$WORK/out_system.img"        "$UPDATE_DIR/system.img"
   cp "$WORK/out_vbmeta.img"        "$UPDATE_DIR/vbmeta.img"
   cp "$WORK/out_vbmeta_system.img" "$UPDATE_DIR/vbmeta_system.img"
-  ( cd "$UPDATE_DIR" && zip -q image.zip system.img vbmeta.img vbmeta_system.img )
+  ZIP_FILES=(system.img vbmeta.img vbmeta_system.img)
+  if [[ -f "$WORK/out_product.img" ]]; then
+    cp "$WORK/out_product.img" "$UPDATE_DIR/product.img"
+    ZIP_FILES+=(product.img)
+  fi
+  ( cd "$UPDATE_DIR" && zip -q image.zip "${ZIP_FILES[@]}" )
   cp "$UPDATE_DIR/image.zip" "$OUT/update.zip"
 else
   echo "[avbgraft] warning: 'zip' not found on host; skipping update.zip build" >&2
