@@ -17,7 +17,7 @@
 #
 # Usage:
 #   ./avbgraft.sh --factory <bluejay-*-factory-*.zip> --out ./out [--key key.pem]
-#                 [--insecure-adb] [--bake-adb-key[=<adbkey.pub>]]
+#                 [--insecure-adb] [--bake-adb-key[=<adbkey.pub>]] [--seed-rc <script>]
 #
 # --insecure-adb also sets ro.adb.secure=0 in /system/build.prop. On some builds
 # ro.adb.secure is sourced from the boot ramdisk and this has no effect, so
@@ -29,6 +29,12 @@
 # prompt even while ro.adb.secure=1. With no value it uses ~/.android/adbkey.pub,
 # generating one with `adb keygen` if it does not exist. This also patches and
 # re-signs product.img and updates the product digest in vbmeta_system.
+#
+# --seed-rc <script> bakes a boot-complete seed into the system image:
+# /system/etc/avbgraft_seed.sh plus /system/etc/init/avbgraft-seed.rc (which
+# init auto-imports). The rc execs the script once at sys.boot_completed=1 as
+# root in the u:r:magisk:s0 domain, so callers can run a first-boot root action
+# with no /data hook (survives a userdata wipe).
 #
 # Output (in --out): system.img, vbmeta_system.img, vbmeta.img, and the public
 # key as avb_pkmd.bin. Flash them with flash.sh, or by hand:
@@ -49,8 +55,9 @@ KEEP_WORK=0
 INSECURE_ADB=0
 BAKE_ADB_KEY=0
 ADB_KEY_PATH=""
+SEED_RC=""
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,6 +71,8 @@ while [[ $# -gt 0 ]]; do
     --insecure-adb) INSECURE_ADB=1; shift ;;
     --bake-adb-key)    BAKE_ADB_KEY=1; shift ;;
     --bake-adb-key=*)  BAKE_ADB_KEY=1; ADB_KEY_PATH="${1#*=}"; shift ;;
+    --seed-rc)   SEED_RC="$2"; shift 2 ;;
+    --seed-rc=*) SEED_RC="${1#*=}"; shift ;;
     -h|--help)   usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -128,9 +137,24 @@ if [[ "$BAKE_ADB_KEY" -eq 1 ]]; then
   echo "[avbgraft] baking adb key: $ADB_KEY_PATH"
 fi
 
+# Resolve an optional boot-complete seed script to bake into the system image.
+# When provided, avbgraft writes it to /system/etc/avbgraft_seed.sh and adds
+# /system/etc/init/avbgraft-seed.rc, which Android's init auto-imports. The rc
+# runs the script at sys.boot_completed=1 as root in the u:r:magisk:s0 domain
+# (proven to be reachable from init on Magisk-patched boots), so a caller can
+# perform a root action on first boot without any /data hook (survives -w wipe).
+SEED_SCRIPT=0
+if [[ -n "$SEED_RC" ]]; then
+  [[ -f "$SEED_RC" ]] || { echo "error: --seed-rc script not found: $SEED_RC" >&2; exit 1; }
+  cp "$SEED_RC" "$WORK/avbgraft_seed.sh"
+  SEED_SCRIPT=1
+  echo "[avbgraft] baking boot-complete seed script: $SEED_RC"
+fi
+
 # Everything below runs inside the container against the bind-mounted work dir.
 docker run --rm --platform linux/arm64 \
   -e INSECURE_ADB="$INSECURE_ADB" -e BAKE_ADB_KEY="$BAKE_ADB_KEY" \
+  -e SEED_SCRIPT="$SEED_SCRIPT" \
   -v "$WORK:/work" "$IMAGE" bash -euo pipefail -c '
   cd /work
   echo "[c] extracting our public key (avb_pkmd)"
@@ -157,6 +181,36 @@ docker run --rm --platform linux/arm64 \
     echo "[c] warning: no property lines matched; build.prop unchanged" >&2
   fi
   debugfs -R "cat /system/build.prop" raw.img 2>/dev/null | grep -iE "^ro.debuggable|^ro.adb.secure" || true
+
+  # Optionally bake a boot-complete seed into the system image. Android init
+  # auto-imports every *.rc under /system/etc/init, so avbgraft-seed.rc runs at
+  # sys.boot_completed=1. It execs into u:r:magisk:s0 (uid 0) - the same domain
+  # Magisk-patched init already uses for `magisk --boot-complete` - so the seed
+  # can call `magisk --sqlite`. Files land inside the system ext4, which is then
+  # repacked with a fresh hashtree, so they are covered by our AVB signature and
+  # survive a userdata wipe (nothing lives in /data).
+  if [ "${SEED_SCRIPT:-0}" = "1" ]; then
+    echo "[c] baking boot-complete seed into /system/etc (init auto-import)"
+    # The init rc: import-scanned from /system/etc/init. `exec` (not `service`)
+    # runs once and is reaped; u:r:magisk:s0 0 0 sets the domain + uid/gid.
+    cat > /tmp/avbgraft-seed.rc <<RC
+on property:sys.boot_completed=1
+    exec u:r:magisk:s0 0 0 -- /system/bin/sh /system/etc/avbgraft_seed.sh
+RC
+    # Write the script + rc into the raw system ext4 with correct labels. This
+    # image is system-as-root, so on-disk paths are under /system/ (the same
+    # place `debugfs .../system/build.prop` edits above). /system/etc/init
+    # already exists on stock; create it defensively if a build lacks it.
+    printf "cd /system/etc\nwrite /work/avbgraft_seed.sh avbgraft_seed.sh\n" | debugfs -w raw.img 2>/dev/null
+    printf "set_inode_field /system/etc/avbgraft_seed.sh mode 0100755\n" | debugfs -w raw.img 2>/dev/null
+    printf "ea_set /system/etc/avbgraft_seed.sh security.selinux u:object_r:system_file:s0\\000\n" | debugfs -w raw.img 2>/dev/null
+    debugfs -R "stat /system/etc/init" raw.img >/dev/null 2>&1 || printf "mkdir /system/etc/init\n" | debugfs -w raw.img 2>/dev/null
+    printf "cd /system/etc/init\nwrite /tmp/avbgraft-seed.rc avbgraft-seed.rc\n" | debugfs -w raw.img 2>/dev/null
+    printf "set_inode_field /system/etc/init/avbgraft-seed.rc mode 0100644\n" | debugfs -w raw.img 2>/dev/null
+    printf "ea_set /system/etc/init/avbgraft-seed.rc security.selinux u:object_r:system_file:s0\\000\n" | debugfs -w raw.img 2>/dev/null
+    echo "[c] seed script  : $(debugfs -R "stat /system/etc/avbgraft_seed.sh" raw.img 2>/dev/null | grep -iE "Mode|Size" | tr "\n" " ")"
+    echo "[c] seed rc      : $(debugfs -R "stat /system/etc/init/avbgraft-seed.rc" raw.img 2>/dev/null | grep -iE "Mode|Size" | tr "\n" " ")"
+  fi
 
   echo "[c] repacking system.img with recomputed hashtree + FEC, signed with our key"
   avbroot avb pack --output out_system.img --input-info avb.toml --input-raw raw.img --key key.pem

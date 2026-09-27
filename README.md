@@ -127,6 +127,31 @@ After flashing with `--bake-adb-key`, `adb shell` works immediately with no tap,
 even after a userdata wipe, because the authorization lives in `product`, not in
 `/data`.
 
+### Baking a boot-complete seed (`--seed-rc`)
+
+**`--seed-rc <script>`** bakes a caller-provided script into the system image so
+it runs once, as root, on the first boot after flashing. avbgraft writes the
+script to `/system/etc/avbgraft_seed.sh` and adds
+`/system/etc/init/avbgraft-seed.rc`, both labeled `u:object_r:system_file:s0`.
+Android init auto-imports every `*.rc` under `/system/etc/init`, so the rc runs
+at `sys.boot_completed=1`:
+
+```
+on property:sys.boot_completed=1
+    exec u:r:magisk:s0 0 0 -- /system/bin/sh /system/etc/avbgraft_seed.sh
+```
+
+The `exec` runs the script once as uid 0 in the `u:r:magisk:s0` domain, the same
+domain a Magisk-patched init already uses for `magisk --boot-complete`. Because
+the files live inside the re-signed system partition (covered by the AVB
+hashtree), they survive a userdata wipe with no `/data` hook. avbgraft treats the
+script as opaque; it does not know or care what the script does.
+
+```bash
+# bake a first-boot root action into the system image:
+./avbgraft.sh --factory <zip> --out ./out --seed-rc ./my-seed.sh
+```
+
 ### Skipping the Setup Wizard
 
 avbgraft does not bake a Setup Wizard skip into the image, and it cannot: the
